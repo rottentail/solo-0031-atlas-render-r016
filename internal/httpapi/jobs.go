@@ -3,6 +3,7 @@ package httpapi
 import (
 	"atlas-render/internal/model"
 	"atlas-render/internal/observe"
+	"atlas-render/internal/service"
 	"net/http"
 )
 
@@ -15,13 +16,30 @@ func (a API) submit(w http.ResponseWriter, r *http.Request) {
 		fail(w, e)
 		return
 	}
-	v, e := a.Service.Submit(b.SnapshotID, b.Scale, r.Header.Get("Idempotency-Key"))
+	v, e := a.Service.SubmitDetailed(b.SnapshotID, b.Scale, r.Header.Get("Idempotency-Key"))
 	if e != nil {
 		fail(w, e)
 		return
 	}
-	v.Payload = model.Snapshot{}
-	write(w, 202, v)
+	w.Header().Set(CommitmentHeader, string(model.Committed))
+	if v.Outcome == service.SubmissionReplayed {
+		w.Header().Set(ReplayHeader, "true")
+	}
+	job := v.Job
+	job.Payload = model.Snapshot{}
+	write(w, 202, job)
+}
+func (a API) lookupSubmission(w http.ResponseWriter, r *http.Request) {
+	v, e := a.Service.LookupSubmission(r.PathValue("key"))
+	if e != nil {
+		fail(w, e)
+		return
+	}
+	w.Header().Set(CommitmentHeader, string(model.Committed))
+	w.Header().Set(ReplayHeader, "true")
+	job := v.Job
+	job.Payload = model.Snapshot{}
+	write(w, 200, job)
 }
 func (a API) getJob(w http.ResponseWriter, r *http.Request) {
 	v, ok := a.Service.Store.Read().Jobs[r.PathValue("id")]
@@ -48,6 +66,7 @@ func (a API) retry(w http.ResponseWriter, r *http.Request) {
 		fail(w, e)
 		return
 	}
+	w.Header().Set(CommitmentHeader, string(model.Committed))
 	v.Payload = model.Snapshot{}
 	write(w, 202, v)
 }

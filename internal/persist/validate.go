@@ -7,6 +7,14 @@ import (
 	"fmt"
 )
 
+// Validate checks the integrity of a complete state image.
+//
+// It reports plain errors on purpose. A failed state validation is evidence
+// that the service's own durable or in-memory facts are inconsistent; it is
+// never a statement about the caller's request. Transports must therefore
+// surface it as an internal failure. Callers that validate untrusted external
+// input, such as bundle import, convert these errors to a domain rejection at
+// their own boundary.
 func Validate(s model.State) error {
 	if s.Version != model.FormatVersion {
 		return fmt.Errorf("unsupported state version %d", s.Version)
@@ -19,7 +27,7 @@ func Validate(s model.State) error {
 			return fmt.Errorf("invalid scene record %s", id)
 		}
 		if e := scene.Validate(v.Document); e != nil {
-			return e
+			return fmt.Errorf("invalid scene document %s: %w", id, e)
 		}
 	}
 	for id, v := range s.Assets {
@@ -27,7 +35,7 @@ func Validate(s model.State) error {
 			return fmt.Errorf("invalid asset record %s", id)
 		}
 		if e := ValidateAsset(v); e != nil {
-			return e
+			return fmt.Errorf("invalid asset %s: %w", id, e)
 		}
 	}
 	for id, v := range s.Snapshots {
@@ -38,7 +46,7 @@ func Validate(s model.State) error {
 			return fmt.Errorf("orphan snapshot %s", id)
 		}
 		if e := ValidateSnapshot(v); e != nil {
-			return e
+			return fmt.Errorf("invalid snapshot %s: %w", id, e)
 		}
 	}
 	for id, j := range s.Jobs {
@@ -62,7 +70,7 @@ func Validate(s model.State) error {
 			return fmt.Errorf("invalid job state")
 		}
 		if e := ValidateSnapshot(j.Payload); e != nil {
-			return e
+			return fmt.Errorf("invalid job payload %s: %w", id, e)
 		}
 	}
 	for id, a := range s.Artifacts {
@@ -93,37 +101,43 @@ func Validate(s model.State) error {
 	}
 	return nil
 }
+
+// ValidateAsset checks that stored asset bytes match their declared digest and
+// dimensions. Failures describe corrupt internal data, not bad input.
 func ValidateAsset(a model.Asset) error {
 	if model.Digest(a.PNG) != a.Digest {
-		return model.Invalid("asset digest mismatch")
+		return fmt.Errorf("asset digest mismatch")
 	}
 	img, e := codec.Decode(a.PNG)
 	if e != nil {
-		return e
+		return fmt.Errorf("asset bytes are not a valid PNG: %w", e)
 	}
 	if img.Bounds().Dx() != a.Width || img.Bounds().Dy() != a.Height {
-		return model.Invalid("asset dimensions mismatch")
+		return fmt.Errorf("asset dimensions mismatch")
 	}
 	return nil
 }
+
+// ValidateSnapshot checks that a snapshot's document, digest and asset closure
+// agree with each other.
 func ValidateSnapshot(v model.Snapshot) error {
 	if e := scene.Validate(v.Document); e != nil {
-		return e
+		return fmt.Errorf("invalid snapshot document: %w", e)
 	}
 	if model.SnapshotDigest(v) != v.Digest {
-		return model.Invalid("snapshot digest mismatch")
+		return fmt.Errorf("snapshot digest mismatch")
 	}
 	refs := scene.References(v.Document)
 	if len(refs) != len(v.Assets) {
-		return model.Invalid("snapshot asset closure mismatch")
+		return fmt.Errorf("snapshot asset closure mismatch")
 	}
 	for _, id := range refs {
 		a, ok := v.Assets[id]
 		if !ok || id != a.ID {
-			return model.Invalid("snapshot asset missing")
+			return fmt.Errorf("snapshot asset missing: %s", id)
 		}
 		if e := ValidateAsset(a); e != nil {
-			return e
+			return fmt.Errorf("snapshot asset %s: %w", id, e)
 		}
 	}
 	return nil

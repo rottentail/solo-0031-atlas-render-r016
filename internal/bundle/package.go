@@ -4,7 +4,6 @@ import (
 	"atlas-render/internal/model"
 	"atlas-render/internal/persist"
 	"encoding/json"
-	"fmt"
 )
 
 type Package struct {
@@ -19,6 +18,13 @@ func Export(s model.Snapshot) Package {
 	p.Digest = model.CanonicalDigest(p.Snapshot)
 	return p
 }
+
+// Validate checks an untrusted package before it is imported.
+//
+// persist.ValidateSnapshot reports integrity failures as plain errors because
+// they are internal when they occur on this service's own state. Here the same
+// failure is about the caller's package, so it is translated into a domain
+// rejection at this boundary.
 func Validate(p Package) error {
 	if p.Format != "atlas-scene" || p.Version != 1 {
 		return model.Invalid("unsupported scene package")
@@ -27,7 +33,7 @@ func Validate(p Package) error {
 		return model.Invalid("package checksum mismatch")
 	}
 	if e := persist.ValidateSnapshot(p.Snapshot); e != nil {
-		return e
+		return model.Invalid("invalid package snapshot: %v", e)
 	}
 	return nil
 }
@@ -37,7 +43,7 @@ func Decode(data []byte) (Package, error) {
 		return p, model.Invalid("package exceeds 12MiB")
 	}
 	if e := json.Unmarshal(data, &p); e != nil {
-		return p, fmt.Errorf("decode package: %w", e)
+		return p, model.Invalid("invalid package JSON: %v", e)
 	}
 	return p, Validate(p)
 }

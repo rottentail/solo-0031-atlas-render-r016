@@ -19,9 +19,22 @@ type Worker struct {
 	active map[string]context.CancelFunc
 }
 
+// renderResult is the compressed outcome of one attempt. It is kept separate
+// from the transaction that records it: rendering can fail for domain reasons
+// or environment reasons, and only the commit itself decides the job state.
+type renderResult struct {
+	err       error
+	cancelled bool
+	artifact  *model.Artifact
+}
+
 func New(st *persist.Store) *Worker {
 	return &Worker{store: st, active: map[string]context.CancelFunc{}}
 }
+
+// Recover returns running jobs to the queue without incrementing the attempt.
+// A failed recovery write is an internal error: callers must not treat the
+// service as ready, because the durable queue is still in its old shape.
 func (w *Worker) Recover() error {
 	return w.store.Update(func(s *model.State) error {
 		for id, j := range s.Jobs {
@@ -89,7 +102,12 @@ func (w *Worker) claim() (model.Job, bool, error) {
 		found = true
 		return nil
 	})
-	return job, found, e
+	if e != nil {
+		// A failed claim write means the job is still queued durably; the
+		// worker did not acquire it and must not render it.
+		return model.Job{}, false, e
+	}
+	return job, found, nil
 }
 func (w *Worker) step(parent context.Context) error {
 	j, ok, e := w.claim()
@@ -107,37 +125,75 @@ func (w *Worker) step(parent context.Context) error {
 	if current.State != "running" {
 		cancel()
 	}
-	plan, e := raster.Compile(j.Payload, j.Scale)
-	var data []byte
-	if e == nil {
-		var imgErr error
-		img, imgErr := plan.Render(ctx)
-		e = imgErr
-		if e == nil {
-			data, e = codec.Encode(img)
-		}
-	}
+	result := w.render(ctx, j)
 	if parent.Err() != nil {
+		// The process is stopping. Leave the job running; startup recovery
+		// will requeue it without treating this attempt as failed.
 		return nil
 	}
+	return w.record(j, result)
+}
+
+// render performs one attempt and classifies its outcome without touching
+// durable state.
+func (w *Worker) render(ctx context.Context, j model.Job) renderResult {
+	plan, e := raster.Compile(j.Payload, j.Scale)
+	if e != nil {
+		return renderResult{err: e}
+	}
+	img, e := plan.Render(ctx)
+	if e != nil {
+		return renderResult{err: e, cancelled: errors.Is(e, context.Canceled)}
+	}
+	data, e := codec.Encode(img)
+	if e != nil {
+		return renderResult{err: e}
+	}
+	a := model.Artifact{ID: "", JobID: j.ID, State: "live", Digest: model.Digest(data), Width: plan.Width, Height: plan.Height, PNG: data}
+	return renderResult{artifact: &a}
+}
+
+// record commits an attempt's outcome.
+//
+// The job identity (state and attempt) is re-checked inside the transaction, so
+// a cancel or retry that committed during rendering wins and a stale attempt
+// records nothing. A successful-looking render is turned into a succeeded job
+// only if the same transaction also stores its artifact; the two facts become
+// visible together or not at all.
+func (w *Worker) record(attempt model.Job, result renderResult) error {
 	return w.store.Update(func(s *model.State) error {
-		v := s.Jobs[j.ID]
-		if v.State != "running" || v.Attempt != j.Attempt {
+		v, ok := s.Jobs[attempt.ID]
+		if !ok {
+			return model.Internal("claimed job disappeared", nil)
+		}
+		if v.State != "running" || v.Attempt != attempt.Attempt {
+			// A newer fact (cancel or retry) already decided this attempt.
 			return nil
 		}
 		v.UpdatedAt = time.Now().UTC()
-		if e != nil {
-			if errors.Is(e, context.Canceled) {
+		if result.cancelled || result.err != nil {
+			if result.cancelled {
 				v.State = "cancelled"
 			} else {
 				v.State = "failed"
-				v.Error = e.Error()
+				v.Error = result.err.Error()
 			}
 			s.Jobs[v.ID] = v
 			s.Emit("job."+v.State, v.ID)
 			return nil
 		}
-		a := model.Artifact{ID: model.ID("png", s.Sequence+1), JobID: v.ID, State: "live", Digest: model.Digest(data), Width: plan.Width, Height: plan.Height, PNG: data}
+		if result.artifact == nil {
+			// A nil artifact without an error is a programming fault, not a
+			// legitimate success; failing the attempt avoids a phantom job.
+			v.State = "failed"
+			v.Error = "render produced no artifact"
+			s.Jobs[v.ID] = v
+			s.Emit("job.failed", v.ID)
+			return nil
+		}
+		a := *result.artifact
+		a.ID = model.ID("png", s.Sequence+1)
+		a.JobID = v.ID
 		s.Artifacts[a.ID] = a
 		v.State = "succeeded"
 		v.ArtifactID = a.ID

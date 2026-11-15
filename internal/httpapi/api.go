@@ -15,19 +15,58 @@ type API struct {
 	Worker  *engine.Worker
 }
 
+// CommitmentHeader is set on every error response and on replayed job
+// creation. It is the transport form of model.Commitment and the only thing a
+// client should use to decide whether a failure may be retried as new work.
+const (
+	CommitmentHeader = "X-Atlas-Commitment"
+	ReplayHeader     = "Idempotent-Replay"
+)
+
 func write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func fail(w http.ResponseWriter, e error) {
-	var de *model.Error
-	if errors.As(e, &de) {
-		write(w, de.Status, map[string]string{"code": de.Code, "error": de.Message})
-		return
-	}
-	write(w, 500, map[string]string{"code": "internal", "error": "operation could not be committed"})
+
+// errorBody is the wire form of a classified failure. commitment is repeated
+// in the body because a client behind a proxy may not see the header.
+type errorBody struct {
+	Code       string `json:"code"`
+	Error      string `json:"error"`
+	Commitment string `json:"commitment"`
 }
+
+// fail renders a classified error. Domain kinds select the status; internal
+// failures are always 500 regardless of the text in the underlying error.
+func fail(w http.ResponseWriter, e error) {
+	commitment := model.CommitmentOf(e)
+	status, code, message := 500, "internal", "operation could not be committed"
+	if de, ok := model.ErrorOf(e); ok {
+		code = de.Code()
+		message = de.Error()
+		switch de.Kind {
+		case model.KindInvalid:
+			status = 400
+		case model.KindMissing:
+			status = 404
+		case model.KindConflict:
+			status = 409
+		case model.KindGone:
+			status = 410
+		case model.KindCapacity:
+			status = 429
+		case model.KindInternal:
+			status = 500
+			// Do not describe internal storage mechanics to clients; the
+			// commitment is the actionable part.
+			message = "operation could not be committed"
+		}
+	}
+	w.Header().Set(CommitmentHeader, string(commitment))
+	write(w, status, errorBody{Code: code, Error: message, Commitment: string(commitment)})
+}
+
 func decode(w http.ResponseWriter, r *http.Request, dst any) error {
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 12<<20))
 	d.DisallowUnknownFields()
@@ -55,6 +94,7 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("POST /v1/imports/{id}", a.importPackage)
 	m.HandleFunc("POST /v1/jobs", a.submit)
 	m.HandleFunc("GET /v1/jobs/{id}", a.getJob)
+	m.HandleFunc("GET /v1/idempotency/{key}", a.lookupSubmission)
 	m.HandleFunc("POST /v1/jobs/{id}/cancel", a.cancel)
 	m.HandleFunc("POST /v1/jobs/{id}/retry", a.retry)
 	m.HandleFunc("GET /v1/artifacts/{id}", a.download)

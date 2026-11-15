@@ -101,6 +101,19 @@ class Demo:
     def submit(self, snapshot, key='render-one', scale=1):
         return self.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': scale}, 202, {'Idempotency-Key': key})
 
+    def submit_outcome(self, snapshot, key='render-one', scale=1):
+        """Submit and return (job, status, commitment, replayed)."""
+        hdr = {'Idempotency-Key': key, 'Content-Type': 'application/json'}
+        request = urllib.request.Request(self.url + '/v1/jobs', data=json.dumps({'snapshotId': snapshot['id'], 'scale': scale}).encode(), method='POST', headers=hdr)
+        try:
+            response = urllib.request.urlopen(request, timeout=15)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            body = response.read()
+            payload = json.loads(body) if body and response.headers.get('Content-Type', '').startswith('application/json') else {}
+            return payload, response.status, response.headers.get('X-Atlas-Commitment'), response.headers.get('Idempotent-Replay') == 'true'
+
 
 def run(demo, workflow, out):
     d = sample()
@@ -148,6 +161,14 @@ def run(demo, workflow, out):
     job = demo.submit(snapshot)
     if workflow == 'submit-render':
         assert demo.submit(snapshot)['id'] == job['id']
+        replay, status, commitment, replayed = demo.submit_outcome(snapshot)
+        assert (status, commitment, replayed) == (202, 'committed', True), (status, commitment, replayed)
+        assert replay['id'] == job['id']
+        # An unused key is reported as never accepted, not as an unknown task.
+        demo.call('GET', '/v1/idempotency/never-sent', status=404)
+        # The committed key resolves to the same job, including after retries
+        # and result cleanup, so a client never needs to invent a new key.
+        assert demo.call('GET', '/v1/idempotency/render-one')['id'] == job['id']
         demo.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': 2}, 409, {'Idempotency-Key': 'render-one'})
     if workflow == 'revoke-snapshot':
         demo.call('POST', '/v1/snapshots/' + snapshot['id'] + '/revoke')

@@ -16,6 +16,7 @@
 | POST /imports/{id} | name, package | 新场景，201 |
 | POST /jobs | snapshotId, scale；请求头Idempotency-Key | 任务，202 |
 | GET /jobs/{id} | 无 | 任务，200 |
+| GET /idempotency/{key} | 无 | 该键已承诺的任务，200；键未使用为404 |
 | POST /jobs/{id}/cancel | 无 | 任务，200 |
 | POST /jobs/{id}/retry | 无 | 任务，202 |
 | GET /artifacts/{id} | 可选If-None-Match | PNG，200或304 |
@@ -25,6 +26,20 @@
 | GET /events | 无 | 最多500个有序领域事件 |
 
 `GET /healthz` 不带 `/v1`，返回ready。它表明进程已打开并恢复状态，不包含单独的磁盘可写探测。任务响应省略固定输入的有效载荷，输入细节通过快照接口读取。
+
+## 错误与提交承诺
+
+所有失败响应仍是 `{"code", "error"}` 形状，并额外带有 `commitment` 字段；同样的值也放在 `X-Atlas-Commitment` 响应头。客户端只能依据它决定是否可以原样重试，不得从错误文本推断。
+
+| commitment | 含义 | 客户端动作 |
+|---|---|---|
+| not-committed | 持久状态未被替换，收据不存在 | 可用同一幂等键重试 |
+| committed | 变更已成为持久事实，收据存在 | 用同一幂等键重放，取得原任务；不要换键 |
+| unknown | 无法证明是否落地 | 用同一幂等键重放或读取 `GET /idempotency/{key}`；不要当作新任务提交 |
+
+状态码只表示错误类别：400输入不合法、404实体不存在、409状态或版本冲突、410结果已清理、429预算或队列不足、500内部失败。500可能是 not-committed、committed 或 unknown；客户端先读承诺再决定。磁盘写入在原子替换前失败时为 not-committed，替换后无法确认时为 committed 或 unknown。
+
+`POST /jobs` 成功受理返回 202 且 `commitment: committed`；幂等重放返回同一任务并带 `Idempotent-Replay: true`。连接中断后先 `GET /idempotency/{key}`：404表示从未接收，可以原样重试；200返回已承诺任务，不能新建。
 
 文档字段：width、height、background、layers。每个图层有id、kind、width、height、transform、opacity、fill；transform包括x、y、scaleX、scaleY、degrees。图层可以有clip（x/y/width/height），group使用children，polygon使用points，image使用assetId。solid颜料有color；linear还包括endColor、from、to。示例是可直接提交的完整请求。
 

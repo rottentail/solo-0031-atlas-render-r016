@@ -15,20 +15,24 @@ func (s *Service) ImportAsset(id string, data []byte) (model.Asset, error) {
 	if e != nil {
 		return out, e
 	}
-	out = model.Asset{ID: id, Digest: model.Digest(data), State: "available", Width: img.Bounds().Dx(), Height: img.Bounds().Dy(), PNG: data}
+	candidate := model.Asset{ID: id, Digest: model.Digest(data), State: "available", Width: img.Bounds().Dx(), Height: img.Bounds().Dy(), PNG: data}
 	e = s.Store.Update(func(st *model.State) error {
 		if old, ok := st.Assets[id]; ok {
-			if old.Digest == out.Digest && old.State == "available" {
+			if old.Digest == candidate.Digest && old.State == "available" {
 				out = old
 				return nil
 			}
 			return model.Conflict("asset id already exists")
 		}
-		st.Assets[id] = out
+		st.Assets[id] = candidate
 		st.Emit("asset.imported", id)
+		out = candidate
 		return nil
 	})
-	return out, e
+	if e != nil {
+		return model.Asset{}, e
+	}
+	return out, nil
 }
 func (s *Service) RetireAsset(id string) error {
 	return s.Store.Update(func(st *model.State) error {

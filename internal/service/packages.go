@@ -41,5 +41,8 @@ func (s *Service) Import(id, name string, p bundle.Package) (model.Scene, error)
 		st.Emit("scene.imported", id)
 		return nil
 	})
-	return out, e
+	if e != nil {
+		return model.Scene{}, e
+	}
+	return out, nil
 }

@@ -37,7 +37,13 @@ func (s *Service) PutScene(id, name string, expected int, d model.Document) (mod
 		st.Emit("scene.saved", id)
 		return nil
 	})
-	return out, e
+	if e != nil {
+		// A failed commit must never return the candidate scene as if it were
+		// stored; otherwise a direct caller cannot tell a rejection from a
+		// successful save.
+		return model.Scene{}, e
+	}
+	return out, nil
 }
 func (s *Service) SceneState(id string, expected int, target string) (model.Scene, error) {
 	var out model.Scene
@@ -64,7 +70,10 @@ func (s *Service) SceneState(id string, expected int, target string) (model.Scen
 		out = v
 		return nil
 	})
-	return out, e
+	if e != nil {
+		return model.Scene{}, e
+	}
+	return out, nil
 }
 func (s *Service) Freeze(id string, expected int) (model.Snapshot, error) {
 	var out model.Snapshot
@@ -86,11 +95,16 @@ func (s *Service) Freeze(id string, expected int) (model.Snapshot, error) {
 		}
 		out = model.Snapshot{ID: model.ID("snap", st.Sequence+1), SceneID: id, Revision: v.Revision, State: "active", Document: v.Document, Assets: assets, CreatedAt: time.Now().UTC()}
 		out.Digest = model.SnapshotDigest(out)
+		// Publish only after the digest is set; Validate runs on the copy and
+		// would otherwise reject a half-built snapshot.
 		st.Snapshots[out.ID] = out
 		st.Emit("snapshot.frozen", out.ID)
 		return nil
 	})
-	return out, e
+	if e != nil {
+		return model.Snapshot{}, e
+	}
+	return out, nil
 }
 func (s *Service) Revoke(id string) error {
 	return s.Store.Update(func(st *model.State) error {
